@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# Offline build configuration.
+#
+# `vendor/` holds the full source of all 383 crates in Cargo.lock. The source
+# replacement below tells cargo to read from there instead of crates.io, so a
+# build never touches the network — even if ~/.cargo/registry is wiped.
+#
+# Regenerate after changing Cargo.toml (needs network, do it while online):
+#
+#     cargo generate-lockfile        # resolve the new dep
+#     cargo vendor --versioned-dirs  # refresh vendor/
+#
+# Both will fail while `offline = true` is set below — comment it out, run
+# them, put it back.
+# ---------------------------------------------------------------------------
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+
+# Belt and braces: refuse to even attempt a network fetch. Turns a silent
+# 30-second hang on a plane into an immediate, honest error.
+[net]
+offline = true

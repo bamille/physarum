@@ -1,0 +1,49 @@
+[package]
+name = "airplane"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+publish = false
+
+# ---------------------------------------------------------------------------
+# Pinned dependency versions.
+#
+# These are the exact pins from gpu-sim-course, so anything you learned there
+# transfers verbatim: same wgpu API surface, same winit `ApplicationHandler`
+# shape, same egui integration.
+#
+# The load-bearing pin is `wgpu = "=29.0.4"`. wgpu 30 is released, but
+# egui-wgpu 0.35 depends on wgpu ^29.0 — bumping wgpu alone breaks the egui
+# integration. Bump both together or neither.
+#
+# Every version is `=exact` on purpose. You are developing offline against a
+# vendored source tree (see .cargo/config.toml); a caret range that resolves to
+# a version that is not in vendor/ is a build failure with a confusing message.
+# ---------------------------------------------------------------------------
+[dependencies]
+wgpu = "=29.0.4"
+winit = "=0.30.13"
+bytemuck = { version = "=1.25.2", features = ["derive"] }
+glam = { version = "=0.33.3", features = ["bytemuck"] }
+pollster = "=1.0.1"
+rand = "=0.9.5"
+anyhow = "=1.0.104"
+env_logger = "=0.11.11"
+
+# Live parameter tuning. A slime mold is ~8 numbers (sensor angle, sensor
+# distance, turn speed, move speed, deposit amount, decay rate, diffuse rate,
+# agent count) and the whole character of the sim lives in those numbers.
+# Sliders are not a luxury here.
+egui = "=0.35.0"
+egui-wgpu = "=0.35.0"
+egui-winit = "=0.35.0"
+egui_plot = "=0.36.0"
+
+# GPU work dominates, so unoptimised dependencies are painful even in dev
+# builds. Optimise deps fully, keep your own crate at opt-level 1 so debug
+# info and compile times stay usable.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
