@@ -1,7 +1,5 @@
 use anyhow::{Context as _, Result};
 
-use rand::{RngCore, Rng};
-
 use glam::{Vec2, Vec3};
 
 pub struct GpuContext {
@@ -41,7 +39,7 @@ impl GpuContext {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("gpu-sim-course device"),
+                label: Some("supah nice graphics device"),
                 required_features: required | (optional & available),
                 // `downlevel_defaults` would cap storage buffers at 128 MiB and
                 // workgroup storage at 16 KiB. We are targeting a real desktop
@@ -80,12 +78,13 @@ impl GpuContext {
 }
 
 
-// Static uniform buffer containing camera information + sim params.
-//
-// One buffer, bound by both the compute passes (as `params`) and the render
-// pass (as `camera`). std140-compatible by construction: three vec4s after a
-// mat4x4, so every member is already 16-byte aligned and there is no implicit
-// padding for WGSL to disagree with.
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+
+/// Camera uniform. std140-compatible by construction: three vec4s after a
+/// mat4x4, so every member is already 16-byte aligned and there is no implicit
+/// padding for WGSL to disagree with.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Camera {
@@ -95,7 +94,8 @@ pub struct Camera {
     /// World-space camera basis, so the quad can be expanded facing the viewer.
     right: [f32; 4],
     up: [f32; 4],
-    /// `[agent_radius, speed_scale, _, _]` — see `CameraRig`.
+    /// `[agent_radius, _, _, _]`. Everything sim-side now lives in
+    /// `SimParams`; this is purely render state.
     params: [f32; 4],
 }
 
@@ -105,12 +105,11 @@ impl Camera {
         eye: Vec3,
         target: Vec3,
         fov_y: f32,
-        radius: f32,
-        speed_scale: f32,
+        agent_radius: f32,
     ) -> Self {
-        // Near/far scale with how far away the camera actually is. Hardcoded
+        // Near/far scale with how far away the camera actually is. A hardcoded
         // 0.05..100.0 works for a unit-scale scene and silently clips
-        // everything when the world is 100 units across, which ours is.
+        // everything when the world is hundreds of units across, which ours is.
         let dist = (eye - target).length().max(1e-3);
         let proj = glam::camera::rh::proj::directx::perspective(
             fov_y,
@@ -131,15 +130,13 @@ impl Camera {
             view_proj: (proj * view).to_cols_array_2d(),
             right: [right.x, right.y, right.z, 0.0],
             up: [up.x, up.y, up.z, 0.0],
-            params: [radius, speed_scale, 0.0, 0.0],
+            params: [agent_radius, 0.0, 0.0, 0.0],
         }
     }
 
-    /// The uniform buffer both the compute and render bind groups point at.
-    /// Created outside `Sim` and `Renderer` so neither has to own the other.
     pub fn create_buffer(device: &wgpu::Device) -> wgpu::Buffer {
         device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera + params uniform"),
+            label: Some("camera uniform"),
             size: std::mem::size_of::<Camera>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -154,207 +151,580 @@ pub struct CameraRig {
     pub eye: Vec3,
     pub target: Vec3,
     pub fov_y: f32,
-    /// Billboard half-size, in world units. This is the on-screen size of one
-    /// agent, and is unrelated to the radius agents are seeded within.
+    /// Half-extent of the simulated world, in world units. The camera frames
+    /// exactly this.
+    pub world_half: Vec2,
+    /// Billboard half-size for a single agent, in world units.
     pub agent_radius: f32,
-    pub speed_scale: f32,
 }
 
 impl CameraRig {
-    /// A head-on camera pulled back far enough to frame a disc of
-    /// `world_radius` about the origin, with a bit of margin.
-    pub fn framing(world_radius: f32, agent_radius: f32) -> Self {
+    /// A head-on camera pulled back so the world rectangle exactly fills the
+    /// window vertically.
+    ///
+    /// Note the margin is 1.0, not 1.2. With a margin the simulation sits as a
+    /// smaller square inside the window frame with dead space around it, and
+    /// agents wrap at an invisible boundary well inside the glass.
+    pub fn framing(world_half: Vec2, agent_radius: f32) -> Self {
         let fov_y = 60f32.to_radians();
-        let dist = (world_radius * 1.2) / (fov_y * 0.5).tan();
+        let dist = world_half.y / (fov_y * 0.5).tan();
         Self {
             eye: Vec3::new(0.0, 0.0, dist),
             target: Vec3::ZERO,
             fov_y,
+            world_half,
             agent_radius,
-            speed_scale: 1.0,
         }
     }
 
     pub fn uniform(&self, aspect: f32) -> Camera {
-        Camera::fixed_camera(
-            aspect,
-            self.eye,
-            self.target,
-            self.fov_y,
-            self.agent_radius,
-            self.speed_scale,
-        )
+        Camera::fixed_camera(aspect, self.eye, self.target, self.fov_y, self.agent_radius)
     }
 }
 
 
+// ---------------------------------------------------------------------------
+// Simulation parameters
+// ---------------------------------------------------------------------------
+
+/// The whole character of a slime mold lives in these numbers — see docs/02
+/// for values known to work and what each one does to the picture.
+///
+/// Laid out in four 16-byte rows so the WGSL mirror needs no padding games.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SimParams {
+    // row 0
+    pub grid: [u32; 2],
+    pub n_agents: u32,
+    pub frame: u32,
+    // row 1
+    pub world_half: [f32; 2],
+    pub dt: f32,
+    /// Radians between the centre sensor and each side sensor.
+    pub sensor_angle: f32,
+    // row 2
+    /// How far ahead the sensors sample, in world units (= trail cells).
+    pub sensor_dist: f32,
+    /// Radians per second an agent can turn.
+    pub turn_speed: f32,
+    /// World units per second.
+    pub move_speed: f32,
+    /// Exponent applied to the sensor readings when picking a direction. 0
+    /// makes the choice uniformly random and the agents a gas; large values
+    /// make it a hard argmax and the agents brittle. See `choose_turn` in
+    /// compute.wgsl.
+    pub sensitivity: f32,
+    // row 3
+    /// Added to the trail cell under the agent each step.
+    pub deposit: f32,
+    /// Trail is multiplied by `exp(-decay_rate * dt)` each step, so the
+    /// half-life is in seconds and does not shift with frame rate.
+    pub decay_rate: f32,
+    /// How far each step blurs toward the neighbourhood mean, 0..1.
+    pub diffuse_rate: f32,
+    /// Invocations per row of the agent dispatch, so the shader can rebuild a
+    /// flat agent index from a 2D dispatch. See `dispatch_2d`.
+    pub row_width: u32,
+    // row 4
+    /// Radius of the disc agents are seeded into, in world units.
+    pub init_rad: f32,
+    pub _pad: [f32; 3],
+}
+
+impl SimParams {
+    pub fn new(grid: [u32; 2], n_agents: u32, world_half: Vec2, init_rad: f32) -> Self {
+        Self {
+            grid,
+            n_agents,
+            frame: 0,
+            world_half: world_half.into(),
+            dt: 0.0,
+            sensor_angle: 22.5f32.to_radians(),
+            sensor_dist: 1.5,
+            turn_speed: 8.0,
+            move_speed: 100.0,
+            sensitivity: 10.0,
+            deposit: 1.0,
+            decay_rate: 3.0,
+            diffuse_rate: 9.0,
+            row_width: dispatch_2d(n_agents.div_ceil(WORKGROUP_SIZE)).0 * WORKGROUP_SIZE,
+            init_rad,
+            _pad: [0.0; 3],
+        }
+    }
+}
+
+/// Maximum workgroups per dispatch dimension. A hard WebGPU limit, not an
+/// adapter one — every backend has it.
+pub const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
+
+/// Split a workgroup count across two dimensions when it will not fit in one.
+///
+/// At `@workgroup_size(64)` a 1D dispatch tops out at 65535 * 64 = 4,193,280
+/// agents. Past that the dispatch is laid out as a rough square, and the shader
+/// rebuilds the flat index as `gid.y * row_width + gid.x`.
+pub fn dispatch_2d(total_groups: u32) -> (u32, u32) {
+    if total_groups <= MAX_WORKGROUPS_PER_DIM {
+        return (total_groups, 1);
+    }
+    let x = (total_groups as f64).sqrt().ceil() as u32;
+    (x, total_groups.div_ceil(x))
+}
+
+
+/// Read a WGSL file and report whether it declares every tag (`@compute`,
+/// `@vertex`, ...) outside of a `//` comment.
+///
+/// Every pipeline goes through this so that a shader you are midway through
+/// writing degrades to "that pass does nothing" plus a message, instead of a
+/// validation panic that takes the window with it.
+fn load_shader(path: &str, tags: &[&str]) -> Option<String> {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{path}: {e} — that pass is disabled");
+            return None;
+        }
+    };
+    let code: String = source
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for tag in tags {
+        if !code.contains(tag) {
+            eprintln!("{path}: no {tag} entry point yet — that pass is disabled");
+            return None;
+        }
+    }
+    Some(source)
+}
+
+fn storage_entry(
+    binding: u32,
+    read_only: bool,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Simulation
+// ---------------------------------------------------------------------------
+
+pub const INIT_SHADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/init.wgsl");
+pub const COMPUTE_SHADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/compute.wgsl");
+pub const DIFFUSE_SHADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/diffuse.wgsl");
+
+/// Must match `@workgroup_size(..)` in compute.wgsl. Nothing checks this for
+/// you — get it wrong and you silently under- or over-dispatch.
+pub const WORKGROUP_SIZE: u32 = 64;
+/// Must match `@workgroup_size(..)` in diffuse.wgsl.
+pub const DIFFUSE_WORKGROUP: u32 = 8;
+
+/// Trail channels per cell. Four, because a `vec4<f32>` is the natural GPU
+/// unit and costs the same as one float — the spare three are what multiple
+/// species will deposit into.
+pub const TRAIL_CHANNELS: u64 = 4;
+
+// NOTE: `Sim` deliberately does not hold a `&GpuContext`. `State` in main.rs
+// owns the `GpuContext` *and* the `Sim`, so a borrow here would make `State`
+// self-referential, which does not compile. The methods take `&GpuContext`
+// instead.
 pub struct Sim {
-    agents: Vec<Agent>,
     agent_buffers: [wgpu::Buffer; 2],
-    agent_bind_groups: [wgpu::BindGroup; 2], // a->b, b->a
-    n_agents: u32,
-    iter: u32,
+    /// Trail map, ping-ponged: the diffuse pass is a stencil (each cell reads
+    /// its neighbours), so it cannot write in place.
+    trail_buffers: [wgpu::Buffer; 2],
+    params_buf: wgpu::Buffer,
+
+    agent_bind_groups: [wgpu::BindGroup; 2],
+    diffuse_bind_groups: [wgpu::BindGroup; 2],
+    /// Seeds agent buffer A. Slot resets to 0 alongside it.
+    init_bind_group: wgpu::BindGroup,
+    agent_pipeline: Option<wgpu::ComputePipeline>,
+    diffuse_pipeline: Option<wgpu::ComputePipeline>,
+    init_pipeline: Option<wgpu::ComputePipeline>,
+
+    params: SimParams,
+    /// Which half of every ping-pong pair currently holds live state.
+    slot: usize,
 }
 
 impl Sim {
     pub fn new(
         ctx: &GpuContext,
-        camera_buf: &wgpu::Buffer,
+        grid: [u32; 2],
         n_agents: u32,
+        world_half: Vec2,
         init_rad: f32,
-        speed: f32,
     ) -> Self {
-        // Create agents
-        let mut rng = rand::rng();
-        let agents = vec![init_rad; n_agents as usize]
-        .into_iter()
-        .map(
-            |init_rad| {
-                Agent::new_with_random_placement(&mut rng, init_rad, speed)
+        let params = SimParams::new(grid, n_agents, world_half, init_rad);
+
+        // --- agents ---------------------------------------------------------
+        // No CPU-side agent array: `init.wgsl` seeds buffer A in a dispatch at
+        // the end of this function. At 10M agents the CPU path meant a 240 MB
+        // allocation and an upload of the same before the window could open.
+        //
+        // STORAGE covers both the compute passes (read_write) and the vertex
+        // shader reading it back read-only; a storage buffer does not need
+        // VERTEX usage to be pulled from a vertex stage.
+        let agent_bytes = n_agents as u64 * std::mem::size_of::<Agent>() as u64;
+        let agent_buffer = |label: &str| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: agent_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             })
-        .collect::<Vec<Agent>>();
+        };
+        let agent_buffers = [agent_buffer("agents A"), agent_buffer("agents B")];
 
-        // Create buffer. STORAGE covers both the compute passes (read_write)
-        // and the vertex shader reading it back read-only; a storage buffer
-        // does not need VERTEX usage to be pulled from a vertex stage.
-        let buffer_a = ctx.device.create_buffer(
-            &wgpu::BufferDescriptor {
-                label: Some("Buffer A"),
-                size: std::mem::size_of_val(agents.as_slice()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        // --- trail ----------------------------------------------------------
+        let trail_bytes = grid[0] as u64 * grid[1] as u64 * TRAIL_CHANNELS * 4;
+        let trail_buffer = |label: &str| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: trail_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            }
-        );
+            })
+        };
+        // Both start zeroed, which wgpu guarantees — an empty world.
+        let trail_buffers = [trail_buffer("trail A"), trail_buffer("trail B")];
 
-        let buffer_b = ctx.device.create_buffer(
-            &wgpu::BufferDescriptor {
-                label: Some("Buffer B"),
-                size: std::mem::size_of_val(agents.as_slice()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }
-        );
+        let params_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim params"),
+            size: std::mem::size_of::<SimParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        // Seed A with the initial placement. B is left zeroed; the first step
-        // overwrites it wholesale.
-        ctx.queue
-            .write_buffer(&buffer_a, 0, bytemuck::cast_slice(agents.as_slice()));
-
-        // Ping-pong buffah
-        let bgl = ctx.device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("ping pong"),
+        // --- pass 1: agents -------------------------------------------------
+        // Trail is bound read_write in the same dispatch that senses it. That
+        // is a deliberate race (docs/02 §2): an agent may or may not see a
+        // deposit made by another agent in the same step. The diffuse pass
+        // launders it and it is invisible in the output.
+        let comp = wgpu::ShaderStages::COMPUTE;
+        let agent_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("agent pass bgl"),
                 entries: &[
-                    // Buffer A
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None
-                    },
-                    // Buffer B
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None
-                    },
-                    // Params
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None
-                    },
-                ]
+                    storage_entry(0, false, comp), // agents src
+                    storage_entry(1, false, comp), // agents dst
+                    uniform_entry(2, comp),        // params
+                    storage_entry(3, false, comp), // trail: sense + deposit
+                ],
             });
 
-        let bg_ab = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Buf A->B"),
-            layout: &bgl,
+        let agent_bind_group = |slot: usize, label: &str| {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &agent_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: agent_buffers[slot].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: agent_buffers[1 - slot].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: trail_buffers[slot].as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let agent_bind_groups = [
+            agent_bind_group(0, "agents A->B"),
+            agent_bind_group(1, "agents B->A"),
+        ];
+
+        // --- pass 2: diffuse + decay ----------------------------------------
+        let diffuse_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("diffuse pass bgl"),
+                entries: &[
+                    storage_entry(0, true, comp),  // trail src, read-only
+                    storage_entry(1, false, comp), // trail dst
+                    uniform_entry(2, comp),
+                ],
+            });
+
+        let diffuse_bind_group = |slot: usize, label: &str| {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &diffuse_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: trail_buffers[slot].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: trail_buffers[1 - slot].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let diffuse_bind_groups = [
+            diffuse_bind_group(0, "diffuse A->B"),
+            diffuse_bind_group(1, "diffuse B->A"),
+        ];
+
+        let agent_pipeline = Self::compute_pipeline(
+            ctx,
+            &agent_bgl,
+            COMPUTE_SHADER,
+            "update_agents",
+            "agent pass",
+        );
+        let diffuse_pipeline =
+            Self::compute_pipeline(ctx, &diffuse_bgl, DIFFUSE_SHADER, "diffuse", "diffuse pass");
+
+        // --- pass 0: seeding ------------------------------------------------
+        // Its own layout rather than reusing the agent pass's: seeding needs
+        // one writable agent buffer and the params, and nothing else. Always
+        // targets buffer A, which is why `reset` also puts `slot` back to 0.
+        let init_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("init pass bgl"),
+                entries: &[storage_entry(0, false, comp), uniform_entry(1, comp)],
+            });
+
+        let init_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("init agents A"),
+            layout: &init_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: buffer_a.as_entire_binding(),
+                    resource: agent_buffers[0].as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: buffer_b.as_entire_binding(),
+                    resource: params_buf.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: camera_buf.as_entire_binding(),
-                },
-            ]
+            ],
         });
 
-        let bg_ba = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Buff B-> A"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: buffer_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: camera_buf.as_entire_binding(),
-                },
-            ]
-        });
+        let init_pipeline =
+            Self::compute_pipeline(ctx, &init_bgl, INIT_SHADER, "init_agents", "init pass");
 
-        Sim {
-            agents,
-            agent_buffers: [buffer_a, buffer_b],
-            agent_bind_groups: [bg_ab, bg_ba],
-            n_agents,
-            iter: 0,
+        let mut sim = Sim {
+            agent_buffers,
+            trail_buffers,
+            params_buf,
+            agent_bind_groups,
+            diffuse_bind_groups,
+            init_bind_group,
+            agent_pipeline,
+            diffuse_pipeline,
+            init_pipeline,
+            params,
+            slot: 0,
+        };
+        sim.reset(ctx);
+        sim
+    }
+
+    /// Seed the agents and clear the trail. Also called from `new`.
+    pub fn reset(&mut self, ctx: &GpuContext) {
+        self.slot = 0;
+        // The seeding shader reads n_agents, init_rad and row_width out of the
+        // uniform, so it has to be uploaded before the dispatch, not on the
+        // first `step`.
+        ctx.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+
+        let Some(pipeline) = &self.init_pipeline else {
+            return;
+        };
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("seed"),
+            });
+        for trail in &self.trail_buffers {
+            encoder.clear_buffer(trail, 0, None);
         }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("init agents"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.init_bind_group, &[]);
+            let (gx, gy) = dispatch_2d(self.params.n_agents.div_ceil(WORKGROUP_SIZE));
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        ctx.queue.submit([encoder.finish()]);
+    }
+
+    /// Called from `new`, while the bind group layouts are still in scope — a
+    /// pipeline layout must be built from the same `bgl` the bind groups were,
+    /// or the dispatch is a validation error.
+    fn compute_pipeline(
+        ctx: &GpuContext,
+        bgl: &wgpu::BindGroupLayout,
+        path: &str,
+        entry_point: &str,
+        label: &str,
+    ) -> Option<wgpu::ComputePipeline> {
+        let source = load_shader(path, &["@compute"])?;
+
+        let layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
+            });
+
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+
+        Some(
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&layout),
+                    module: &module,
+                    entry_point: Some(entry_point),
+                    compilation_options: Default::default(),
+                    cache: None,
+                }),
+        )
+    }
+
+    /// One simulation step: sense / steer / move / deposit, then diffuse +
+    /// decay.
+    ///
+    /// Both passes go in one encoder. wgpu inserts the barrier between them,
+    /// so the diffuse pass is guaranteed to see every deposit.
+    pub fn step(&mut self, ctx: &GpuContext, dt: f32) {
+        self.params.dt = dt;
+        self.params.frame = self.params.frame.wrapping_add(1);
+        ctx.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+
+        let (Some(agent_pipeline), Some(diffuse_pipeline)) =
+            (&self.agent_pipeline, &self.diffuse_pipeline)
+        else {
+            return;
+        };
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sim step"),
+            });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("update agents"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(agent_pipeline);
+            pass.set_bind_group(0, &self.agent_bind_groups[self.slot], &[]);
+            // The dispatch is rounded up — in both dimensions once it goes 2D —
+            // so the shader guards the overhang.
+            let (gx, gy) = dispatch_2d(self.params.n_agents.div_ceil(WORKGROUP_SIZE));
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("diffuse + decay"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(diffuse_pipeline);
+            pass.set_bind_group(0, &self.diffuse_bind_groups[self.slot], &[]);
+            pass.dispatch_workgroups(
+                self.params.grid[0].div_ceil(DIFFUSE_WORKGROUP),
+                self.params.grid[1].div_ceil(DIFFUSE_WORKGROUP),
+                1,
+            );
+        }
+
+        ctx.queue.submit([encoder.finish()]);
+
+        // Both pairs flip together: pass 1 wrote agents[1-slot] and pass 2
+        // wrote trail[1-slot], so one index keeps tracking both.
+        self.slot = 1 - self.slot;
     }
 
     pub fn agent_buffers(&self) -> &[wgpu::Buffer; 2] {
         &self.agent_buffers
     }
 
-    pub fn agent_bind_groups(&self) -> &[wgpu::BindGroup; 2] {
-        &self.agent_bind_groups
+    pub fn trail_buffers(&self) -> &[wgpu::Buffer; 2] {
+        &self.trail_buffers
+    }
+
+    pub fn params_buffer(&self) -> &wgpu::Buffer {
+        &self.params_buf
+    }
+
+    pub fn params(&self) -> &SimParams {
+        &self.params
+    }
+
+    pub fn params_mut(&mut self) -> &mut SimParams {
+        &mut self.params
     }
 
     pub fn n_agents(&self) -> u32 {
-        self.n_agents
+        self.params.n_agents
     }
 
-    pub fn agents(&self) -> &[Agent] {
-        &self.agents
-    }
-
-    /// Which of the two agent buffers currently holds live state — i.e. the
-    /// one the renderer should read. Step `iter` binds
-    /// `agent_bind_groups[iter % 2]`, which reads slot `iter % 2` and writes
-    /// the other, so after incrementing `iter` this still points at the fresh
-    /// data.
+    /// Which half of each ping-pong pair holds live state — what the renderer
+    /// should read.
     pub fn current_slot(&self) -> usize {
-        (self.iter % 2) as usize
-    }
-
-    pub fn iter(&self) -> u32 {
-        self.iter
+        self.slot
     }
 }
 
@@ -363,58 +733,39 @@ impl Sim {
 pub struct Agent {
     pos: [f32; 2],
     heading: [f32; 2],
+    /// Per-agent multiplier on `SimParams::move_speed`.
     speed: f32,
-    _pad: f32,
+    /// Which trail channel this agent deposits into and follows. All 0 for
+    /// now; this is the hook for multiple species.
+    species: u32,
 }
-
-impl Agent {
-    /// Generate agent placement within circular radius R
-    fn new_with_random_placement<R: RngCore>(rng: &mut R, rad: f32, speed: f32) -> Self {
-        // `r` first: `get_angle` borrows `rng` uniquely for as long as it lives.
-        let r = rng.random_range(0.0..rad);
-        let mut get_angle = || {rng.random_range(0.0..std::f32::consts::TAU)};
-
-        let pos = Vec2::from_angle(get_angle()) * r;
-        let theta = Vec2::from_angle(get_angle());
-
-        Agent {
-            pos: pos.into(),
-            heading: theta.into(),
-            speed: speed,
-            _pad: 0.0,
-        }
-    }
-}
-
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// Path of the render shader, resolved against the crate root so it does not
-/// matter what directory the binary is launched from. Loaded at runtime rather
-/// than `include_str!`d so that editing WGSL does not trigger a Rust rebuild.
+pub const TRAIL_SHADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/trail.wgsl");
 pub const RENDER_SHADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/render.wgsl");
 
-/// The agent renderer: one camera-facing quad per agent, no vertex buffer.
+/// Two draws, both vertex-buffer-less:
 ///
-/// The draw is `draw(0..4, 0..n_agents)` over a triangle strip. There is no
-/// per-vertex data at all: the vertex shader gets `@builtin(vertex_index)`
-/// 0..4 (which corner of the quad) and `@builtin(instance_index)` (which
-/// agent), reads the agent's position out of the storage buffer, and offsets
-/// it along the camera's `right`/`up` by `params.x`. That is the "one vertex
-/// you write pixels from" — everything else is derived on the GPU.
+/// 1. The trail map, as a single world-space quad spanning the simulation
+///    bounds, transformed by the camera and colour-mapped in the fragment
+///    shader. This is the picture — an agent itself is one pixel.
+/// 2. Optionally the agents, as camera-facing billboards over the top. Useful
+///    for seeing what they are actually doing; press A.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     rig: CameraRig,
     camera_buf: wgpu::Buffer,
-    /// One per agent buffer slot; index with `Sim::current_slot()`.
-    bind_groups: [wgpu::BindGroup; 2],
-    /// `None` until `shaders/render.wgsl` has entry points. Until then the
-    /// pass still runs and clears, which is step 1 of the build order in
-    /// docs/02.
-    pipeline: Option<wgpu::RenderPipeline>,
+
+    trail_bind_groups: [wgpu::BindGroup; 2],
+    trail_pipeline: Option<wgpu::RenderPipeline>,
+    agent_bind_groups: [wgpu::BindGroup; 2],
+    agent_pipeline: Option<wgpu::RenderPipeline>,
+
+    pub show_agents: bool,
     clear: wgpu::Color,
 }
 
@@ -426,7 +777,7 @@ impl Renderer {
         height: u32,
         rig: CameraRig,
         camera_buf: wgpu::Buffer,
-        agent_buffers: &[wgpu::Buffer; 2],
+        sim: &Sim,
     ) -> Result<Self> {
         let config = surface
             .get_default_config(&ctx.adapter, width.max(1), height.max(1))
@@ -438,42 +789,25 @@ impl Renderer {
         };
         surface.configure(&ctx.device, &config);
 
-        // group(0): the shared camera/params uniform, plus the agent buffer
-        // read-only. Read-only storage is visible to every stage, so the
-        // vertex shader can pull straight from the simulation's output with no
-        // copy and no vertex buffer.
-        let bgl = ctx
+        // --- trail pass -----------------------------------------------------
+        // Read-only storage is visible to every stage, so the fragment shader
+        // reads the trail buffer directly. No texture, no sampler, no format
+        // table (docs/02 §2).
+        let trail_bgl = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("render bgl"),
+                label: Some("trail render bgl"),
                 entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
+                    uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT), // camera
+                    storage_entry(1, true, wgpu::ShaderStages::FRAGMENT),  // trail
+                    uniform_entry(2, wgpu::ShaderStages::VERTEX_FRAGMENT), // sim params
                 ],
             });
 
-        let bind_group = |slot: usize, label: &str| {
+        let trail_bind_group = |slot: usize, label: &str| {
             ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
-                layout: &bgl,
+                layout: &trail_bgl,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -481,22 +815,82 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: agent_buffers[slot].as_entire_binding(),
+                        resource: sim.trail_buffers()[slot].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: sim.params_buffer().as_entire_binding(),
                     },
                 ],
             })
         };
-        let bind_groups = [bind_group(0, "render A"), bind_group(1, "render B")];
+        let trail_bind_groups = [
+            trail_bind_group(0, "trail A"),
+            trail_bind_group(1, "trail B"),
+        ];
 
-        let pipeline = Self::build_pipeline(ctx, &bgl, config.format);
+        // --- agent pass -----------------------------------------------------
+        let agent_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("agent render bgl"),
+                entries: &[
+                    uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                    storage_entry(1, true, wgpu::ShaderStages::VERTEX),
+                ],
+            });
+
+        let agent_bind_group = |slot: usize, label: &str| {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &agent_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: sim.agent_buffers()[slot].as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let agent_bind_groups = [
+            agent_bind_group(0, "agents A"),
+            agent_bind_group(1, "agents B"),
+        ];
+
+        // The trail pass covers the whole world quad, so it does not blend.
+        // Agents go over the top additively.
+        let trail_pipeline =
+            Self::render_pipeline(ctx, &trail_bgl, TRAIL_SHADER, config.format, None, "trail");
+        let agent_pipeline = Self::render_pipeline(
+            ctx,
+            &agent_bgl,
+            RENDER_SHADER,
+            config.format,
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            }),
+            "agent billboards",
+        );
 
         let mut this = Self {
             surface,
             config,
             rig,
             camera_buf,
-            bind_groups,
-            pipeline,
+            trail_bind_groups,
+            trail_pipeline,
+            agent_bind_groups,
+            agent_pipeline,
+            show_agents: false,
             clear: wgpu::Color {
                 r: 0.01,
                 g: 0.01,
@@ -508,44 +902,28 @@ impl Renderer {
         Ok(this)
     }
 
-    fn build_pipeline(
+    fn render_pipeline(
         ctx: &GpuContext,
         bgl: &wgpu::BindGroupLayout,
+        path: &str,
         format: wgpu::TextureFormat,
+        blend: Option<wgpu::BlendState>,
+        label: &str,
     ) -> Option<wgpu::RenderPipeline> {
-        let source = match std::fs::read_to_string(RENDER_SHADER) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{RENDER_SHADER}: {e} — rendering clear colour only");
-                return None;
-            }
-        };
-        // Creating a pipeline against a module with no entry points is a hard
-        // validation error, so stay in clear-only mode until the shader is
-        // actually written. Ignore `//` comments — the placeholder file
-        // documents the interface, `@vertex` and all.
-        let code: String = source
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !(code.contains("@vertex") && code.contains("@fragment")) {
-            eprintln!("{RENDER_SHADER}: no @vertex/@fragment yet — rendering clear colour only");
-            return None;
-        }
+        let source = load_shader(path, &["@vertex", "@fragment"])?;
 
         let module = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("render.wgsl"),
+                label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
 
         let layout = ctx
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("render layout"),
-                // wgpu 29: `Option<&BindGroupLayout>` per slot, not `&BindGroupLayout`.
+                label: Some(label),
+                // wgpu 29: `Option<&BindGroupLayout>` per slot.
                 bind_group_layouts: &[Some(bgl)],
                 // wgpu 29: push constants are "immediates" now.
                 immediate_size: 0,
@@ -554,21 +932,17 @@ impl Renderer {
         Some(
             ctx.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("agent billboards"),
+                    label: Some(label),
                     layout: Some(&layout),
                     vertex: wgpu::VertexState {
                         module: &module,
                         entry_point: Some("vs_main"),
                         compilation_options: Default::default(),
-                        // No vertex buffers. Everything comes from
-                        // vertex_index + instance_index + the storage buffer.
+                        // No vertex buffers anywhere in this program.
                         buffers: &[],
                     },
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleStrip,
-                        // Billboards face the camera by construction and the
-                        // corner order flips with the camera basis, so culling
-                        // would only ever eat quads.
                         cull_mode: None,
                         ..Default::default()
                     },
@@ -580,18 +954,7 @@ impl Renderer {
                         compilation_options: Default::default(),
                         targets: &[Some(wgpu::ColorTargetState {
                             format,
-                            // Additive: overlapping agents pile up into
-                            // brightness instead of the last one winning. No
-                            // depth buffer needed, and draw order stops
-                            // mattering.
-                            blend: Some(wgpu::BlendState {
-                                color: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::SrcAlpha,
-                                    dst_factor: wgpu::BlendFactor::One,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                                alpha: wgpu::BlendComponent::OVER,
-                            }),
+                            blend,
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
                     }),
@@ -626,8 +989,8 @@ impl Renderer {
         self.upload_camera(ctx);
     }
 
-    /// Draw the agents in `slot` (see `Sim::current_slot`). Returns `false` if
-    /// the frame was skipped because the surface had nothing to give.
+    /// Returns `false` if the frame was skipped because the surface had
+    /// nothing to give.
     pub fn render(&mut self, ctx: &GpuContext, slot: usize, n_agents: u32) -> bool {
         // wgpu 29: this is an enum, not a Result.
         let frame = match self.surface.get_current_texture() {
@@ -653,7 +1016,7 @@ impl Renderer {
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("agents"),
+                label: Some("draw"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None, // wgpu 29; only meaningful for 3D views
@@ -669,11 +1032,19 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            if let Some(pipeline) = &self.pipeline {
+            if let Some(pipeline) = &self.trail_pipeline {
                 pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &self.bind_groups[slot], &[]);
-                // 4 corners of a triangle strip, one instance per agent.
-                pass.draw(0..4, 0..n_agents);
+                pass.set_bind_group(0, &self.trail_bind_groups[slot], &[]);
+                pass.draw(0..4, 0..1); // one quad, spanning the world
+            }
+
+            if self.show_agents {
+                if let Some(pipeline) = &self.agent_pipeline {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &self.agent_bind_groups[slot], &[]);
+                    // 4 corners of a triangle strip, one instance per agent.
+                    pass.draw(0..4, 0..n_agents);
+                }
             }
         }
 

@@ -3,7 +3,8 @@
 # See docs/04-offline-workflow.md.
 /target
 
-# NOTE: vendor/ is deliberately NOT ignored. It is 565 MB of dependency source
-# and it is the entire reason this project builds without a network. If you
-# want it out of git history but still on disk, add `/vendor` here — the build
-# does not care whether git tracks it.
+# Vendored dependency source. Was tracked deliberately (565 MB) to guarantee
+# offline builds; dropped to save disk. Builds now resolve through crates.io
+# and the shared ~/.cargo/registry cache. Ignored so that running
+# `cargo vendor` locally does not accidentally re-commit it.
+/vendor

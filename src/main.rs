@@ -1,29 +1,51 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use airplane::{Camera, CameraRig, GpuContext, Renderer, Sim};
 
 use anyhow::Result;
 
+use glam::Vec2;
+
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
 
-const N_AGENTS: u32 = 64 * 8;
-const INIT_RAD: f32 = 100.0;
-const SPEED: f32 = 5.0;
+/// Trail map resolution. Also the world size: one cell is one world unit, so
+/// sensor distances and speeds are all in cells, and no scale factor has to be
+/// kept in sync between the two.
+const GRID: [u32; 2] = [2048, 2048];
 
-/// Billboard half-size in world units. `INIT_RAD` is how far agents are
-/// scattered; this is how big one of them looks.
-const AGENT_RAD: f32 = 0.5;
+/// Half-extent of the world, in world units. Matches GRID so that exactly one
+/// trail cell lands under one world unit.
+fn world_half() -> Vec2 {
+    Vec2::new(GRID[0] as f32 * 0.5, GRID[1] as f32 * 0.5)
+}
+
+/// 10M over a 4.2M-cell grid, i.e. ~2.4 agents per cell. Below ~0.5 per cell
+/// the trails are too sparse to reinforce each other and you get wandering
+/// rather than networks; above ~4 every cell saturates and detail washes out.
+const N_AGENTS: u32 = 10_000_000;
+
+/// Agents start in a disc of this radius, in cells, headings random. A filled
+/// circle gives far more structure than scattering over the whole world, which
+/// settles into a boring even mesh (docs/02 §1). Scaled with GRID so the
+/// starting blob stays the same fraction of the world.
+const INIT_RAD: f32 = 600.0;
+
+/// Billboard half-size for the agent overlay, in world units.
+const AGENT_RAD: f32 = 0.8;
 
 struct State {
     window: Arc<Window>,
     ctx: GpuContext,
     sim: Sim,
     renderer: Renderer,
+    last_frame: Instant,
 }
 
 impl State {
@@ -44,21 +66,20 @@ impl State {
             wgpu::Features::empty(),
         ))?;
 
-        // The uniform lives outside both Sim and Renderer: the compute passes
-        // want the sim params out of it and the vertex shader wants the camera
-        // out of it, and neither should have to own the other to get at it.
-        let camera_buf = Camera::create_buffer(ctx.device());
-        let sim = Sim::new(&ctx, &camera_buf, N_AGENTS, INIT_RAD, SPEED);
+        let sim = Sim::new(&ctx, GRID, N_AGENTS, world_half(), INIT_RAD);
 
+        // The camera uniform is owned by the renderer but created out here, so
+        // that neither Sim nor Renderer has to own the other to reach it.
+        let camera_buf = Camera::create_buffer(ctx.device());
         let size = window.inner_size();
         let renderer = Renderer::new(
             &ctx,
             surface,
             size.width,
             size.height,
-            CameraRig::framing(INIT_RAD, AGENT_RAD),
+            CameraRig::framing(world_half(), AGENT_RAD),
             camera_buf,
-            sim.agent_buffers(),
+            &sim,
         )?;
 
         Ok(State {
@@ -66,6 +87,7 @@ impl State {
             ctx,
             sim,
             renderer,
+            last_frame: Instant::now(),
         })
     }
 
@@ -74,7 +96,13 @@ impl State {
     }
 
     fn render(&mut self) {
-        // No sim step yet — the compute passes go here, before the draw.
+        // Clamped so that a stall (dragging the window, waking from sleep)
+        // does not teleport every agent across the world in one step.
+        let dt = self.last_frame.elapsed().as_secs_f32().min(1.0 / 30.0);
+        self.last_frame = Instant::now();
+
+        self.sim.step(&self.ctx, dt);
+
         self.renderer
             .render(&self.ctx, self.sim.current_slot(), self.sim.n_agents());
     }
@@ -109,6 +137,18 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                match event.physical_key {
+                    // Overlay the agents themselves on top of the trail map.
+                    PhysicalKey::Code(KeyCode::KeyA) => {
+                        state.renderer.show_agents = !state.renderer.show_agents;
+                    }
+                    // Re-seed the agents and wipe the trail.
+                    PhysicalKey::Code(KeyCode::KeyR) => state.sim.reset(&state.ctx),
+                    PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
+                    _ => {}
+                }
+            }
             WindowEvent::RedrawRequested => {
                 state.render();
                 state.window.request_redraw();
