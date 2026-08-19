@@ -9,6 +9,8 @@ GPU.
   <img src="docs/media/physarium.png" alt="Physarum transport networks emerging from ten million agents" width="100%">
 </p>
 
+Inspired by [Sebastian Lague](https://www.youtube.com/watch?v=kzwT3wQWAHE) (check him out!).
+
 ## Run it
 
 ```bash
