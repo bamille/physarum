@@ -56,7 +56,7 @@ network (`cargo doc` works offline), but it takes several minutes of battery.
 If you want the docs somewhere safe from `cargo clean`:
 
 ```bash
-cp -r target/doc ~/rust-docs-airplane
+cp -r target/doc ~/rust-docs-physarium
 ```
 
 The WGSL spec is not on disk and is not a crate. If you want it, save

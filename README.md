@@ -1,4 +1,4 @@
-# airplane
+# physarium
 
 A GPU slime mold (Physarum) simulation in Rust + wgpu, set up to be developed
 entirely offline.

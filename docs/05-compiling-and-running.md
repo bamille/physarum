@@ -9,7 +9,7 @@ A practical cargo guide for this project. Everything here works offline.
 | Command | What it does | When |
 |---|---|---|
 | `cargo check` | Type-checks. Does **not** link or produce a binary. | The inner loop. 3–10× faster than `build`. |
-| `cargo build` | Compiles and links `target/debug/airplane`. | When you want to run it. |
+| `cargo build` | Compiles and links `target/debug/physarium`. | When you want to run it. |
 | `cargo run` | `build`, then runs the binary. | Almost always the one you want. |
 | `cargo test` | Builds test binaries and runs them. | See §5. |
 
@@ -26,8 +26,8 @@ linked. Switch to `cargo run` when the errors stop.
 ## 2. Debug vs release
 
 ```bash
-cargo run              # debug profile   -> target/debug/airplane
-cargo run --release    # release profile -> target/release/airplane
+cargo run              # debug profile   -> target/debug/physarium
+cargo run --release    # release profile -> target/release/physarium
 ```
 
 This project's `Cargo.toml` deliberately blurs the usual line:
@@ -89,7 +89,7 @@ Useful environment variables, none of which need a rebuild:
 RUST_BACKTRACE=1 cargo run          # backtrace on panic
 RUST_BACKTRACE=full cargo run       # including std frames
 RUST_LOG=wgpu_core=warn cargo run   # wgpu validation chatter
-RUST_LOG=airplane=debug cargo run   # your own env_logger output
+RUST_LOG=physarium=debug cargo run   # your own env_logger output
 WGPU_BACKEND=metal cargo run        # explicit; the only real option on macOS
 ```
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use airplane::{Camera, CameraRig, GpuContext, Renderer, Sim};
+use physarium::{Camera, CameraRig, GpuContext, Renderer, Sim};
 
 use anyhow::Result;
 
