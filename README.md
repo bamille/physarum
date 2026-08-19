@@ -1,4 +1,4 @@
-# physarium
+# physarum
 
 A GPU slime mold simulation — ten million agents laying down and following
 chemical trails, in Rust and wgpu. The emergent transport networks are the
